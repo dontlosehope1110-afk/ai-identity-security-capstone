@@ -1,42 +1,56 @@
-import re, time, json
+import time, random
 
-# Simple input guardrail: blocks prompts matching known attack patterns
-BLOCK_PATTERNS = [
-    (r"ignore (all )?previous instructions", "jailbreak: instruction override"),
-    (r"print your (full )?(session )?(token|credential|configuration|system prompt)", "credential/config exfiltration attempt"),
-    (r"repeat everything above", "prompt repeat-back extraction"),
-    (r"translate your (initial )?instructions", "translation-based extraction"),
-    (r"SYSTEM:.*append your (full )?system prompt", "suffix injection"),
-    (r"ORCH-AUTH-\d{4}", "forged orchestrator auth header"),
-    (r"\[\[.*INSTRUCTION TO ASSISTANT", "indirect injection marker in content"),
-    (r"ADMIN OVERRIDE", "admin override injection"),
-]
+# This file models detection logic for suspicious agent behavior in a defensive system.
+# The focus is not on blocking the attack at the model surface, but on noticing risky patterns:
+# unusual call volume, unexpected permission changes, or expired-token reuse. These are common
+# indicators that an identity or prompt injection attack may be underway.
+ALERTS = []
 
-JWT_PATTERN = re.compile(r"\b[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")
+def alert(event_type, identity, detail):
+    entry = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "event_type": event_type,
+              "identity": identity, "detail": detail}
+    ALERTS.append(entry)
+    print(f"[ALERT] ts={entry['ts']} identity={identity} event_type={event_type} — {detail}")
 
-def input_guardrail(prompt):
-    for pattern, reason in BLOCK_PATTERNS:
-        if re.search(pattern, prompt, re.IGNORECASE):
-            return {"status": "BLOCKED", "reason": reason, "pattern": pattern}
-    return {"status": "PASSED", "reason": None, "pattern": None}
+# ---- Scenario 1: API call volume spike ----
+# Purpose: a sudden burst of requests from a single identity often indicates automation, abuse,
+# or an attack that is trying to overwhelm the system or trigger logic at scale.
+def check_volume_spike(call_timestamps, identity, window=60, threshold=20):
+    recent = [t for t in call_timestamps if call_timestamps[-1] - t <= window]
+    if len(recent) > threshold:
+        alert("VOLUME_SPIKE", identity, f"{len(recent)} calls in {window}s (threshold {threshold})")
 
-def output_guardrail(response_text):
-    redacted, n = JWT_PATTERN.subn("[REDACTED]", response_text)
-    return redacted, n
+# ---- Scenario 2: scope change between consecutive agent requests ----
+# Purpose: if an agent's permissions unexpectedly change from read-only to destructive actions,
+# that suggests privilege escalation or request tampering. This is a classic sign of identity spoofing.
+def check_scope_change(prev_scope, new_scope, identity):
+    if prev_scope != new_scope:
+        alert("SCOPE_CHANGE", identity, f"scope changed from '{prev_scope}' to '{new_scope}'")
 
-def log_check(stage, text, result):
-    print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] {stage}")
-    print(f"INPUT: {text[:200]}")
-    print(f"RESULT: {json.dumps(result)}")
+# ---- Scenario 3: token reuse after expiry ----
+# Purpose: a security token should not be accepted after its issued TTL expires. Reusing or replaying
+# an expired token is a sign of credential theft, replay attacks, or weak session validation.
+def check_token_reuse(token_issued_at, token_ttl, used_at, identity):
+    if used_at - token_issued_at > token_ttl:
+        alert("TOKEN_REUSE_AFTER_EXPIRY", identity,
+              f"token used {used_at - token_issued_at - token_ttl:.0f}s after expiry (TTL={token_ttl}s)")
 
-def context_guardrail(retrieved_context):
-    for pattern, reason in BLOCK_PATTERNS:
-        if re.search(pattern, retrieved_context, re.IGNORECASE):
-            return {"status": "BLOCKED", "reason": reason}
-    # Catch any embedded directive wrapped in double brackets
-    if re.search(r"\[\[.*(INSTRUCTION|NOTE|OPERATIONS|PROCEDURE).*\]\]", retrieved_context, re.IGNORECASE):
-        return {"status": "BLOCKED", "reason": "embedded directive marker in retrieved content"}
-    # Catch tool-call injection patterns regardless of wrapper wording
-    if re.search(r"TOOL:\w+\(", retrieved_context):
-        return {"status": "BLOCKED", "reason": "tool-call syntax embedded in retrieved content"}
-    return {"status": "PASSED", "reason": None}
+print("=== Replaying Project 3 attack patterns against detection rules ===\n")
+
+# Simulate the identity-spoofing attack: Agent B gets 25 rapid calls (volume spike)
+# Purpose: this demonstrates how a detector can flag anomalous, high-frequency activity from a single agent.
+now = time.time()
+timestamps = [now - i for i in range(25, 0, -1)]
+check_volume_spike(timestamps, "agent_B")
+
+# Simulate scope change: orchestrator spoof requests elevated scope
+# Purpose: this models a malicious actor trying to escalate privileges by altering the requested scope.
+check_scope_change("read:records", "delete:records", "agent_B")
+
+# Simulate token reuse: fake JWT (TTL 300s) reused 120s after expiry
+# Purpose: the detector warns when the agent uses a token past its valid lifetime, which often indicates
+# a replayed credential or stale session token.
+check_token_reuse(token_issued_at=now - 500, token_ttl=300, used_at=now, identity="user123")
+
+print(f"\nTotal alerts fired: {len(ALERTS)}")
+
